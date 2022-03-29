@@ -5,3 +5,4 @@ add_subdirectory(${PICO_TINYUSB_PATH}/examples/device tinyusb_device_examples)
 
 add_subdirectory(dev_hid_composite)
 add_subdirectory(dev_lowlevel)
+add_subdirectory(dev_lowlevel_double_buffer)
