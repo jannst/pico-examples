@@ -31,10 +31,10 @@
 
 // Function prototypes for our device specific endpoint handlers defined
 // later on
-void ep0_in_handler(uint8_t *buf, uint16_t len);
-void ep0_out_handler(uint8_t *buf, uint16_t len);
-void ep1_out_handler(uint8_t *buf, uint16_t len);
-void ep2_in_handler(uint8_t *buf, uint16_t len);
+void ep0_in_handler(uint8_t *buf, uint16_t len, uint8_t should_handle);
+void ep0_out_handler(uint8_t *buf, uint16_t len, uint8_t should_handle);
+void ep1_out_handler(uint8_t *buf, uint16_t len, uint8_t should_handle);
+void ep2_in_handler(uint8_t *buf, uint16_t len, uint8_t should_handle);
 
 // Global device address
 static bool should_set_address = false;
@@ -75,6 +75,7 @@ static struct usb_device_configuration dev_config = {
                         .endpoint_control = &usb_dpram->ep_ctrl[0].out,
                         .buffer_control = &usb_dpram->ep_buf_ctrl[1].out,
                         // First free EPX buffer
+                        //use 2 buffers for double buffering
                         .data_buffer = &usb_dpram->epx_data[0 * 64],
                 },
                 {
@@ -83,7 +84,8 @@ static struct usb_device_configuration dev_config = {
                         .endpoint_control = &usb_dpram->ep_ctrl[1].in,
                         .buffer_control = &usb_dpram->ep_buf_ctrl[2].in,
                         // Second free EPX buffer
-                        .data_buffer = &usb_dpram->epx_data[1 * 64],
+                        //use 2 buffers for double buffering
+                        .data_buffer = &usb_dpram->epx_data[2 * 64],
                 }
         }
 };
@@ -432,13 +434,13 @@ void usb_handle_setup_packet(void) {
  *
  * @param ep, the endpoint to notify.
  */
-static void usb_handle_ep_buff_done(struct usb_endpoint_configuration *ep) {
+static void usb_handle_ep_buff_done(struct usb_endpoint_configuration *ep, uint8_t should_handle) {
     uint32_t buffer_control = *ep->buffer_control;
     // Get the transfer length for this endpoint
     uint16_t len = buffer_control & USB_BUF_CTRL_LEN_MASK;
 
     // Call that endpoints buffer done handler
-    ep->handler((uint8_t *) ep->data_buffer, len);
+    ep->handler((uint8_t *) ep->data_buffer + 64 * should_handle, len, should_handle);
 }
 
 /**
@@ -450,12 +452,13 @@ static void usb_handle_ep_buff_done(struct usb_endpoint_configuration *ep) {
  */
 static void usb_handle_buff_done(uint ep_num, bool in) {
     uint8_t ep_addr = ep_num | (in ? USB_DIR_IN : 0);
-    printf("EP %d (in = %d) done\n", ep_num, in);
+    uint8_t should_handle = usb_hw->buf_cpu_should_handle >> (ep_num*2 + !in) & 1u;
+    //printf("EP %d (in = %d) (addr = %d) done\n", ep_num, in, ep_addr);
     for (uint i = 0; i < USB_NUM_ENDPOINTS; i++) {
         struct usb_endpoint_configuration *ep = &dev_config.endpoints[i];
         if (ep->descriptor && ep->handler) {
             if (ep->descriptor->bEndpointAddress == ep_addr) {
-                usb_handle_ep_buff_done(ep);
+                usb_handle_ep_buff_done(ep, should_handle);
                 return;
             }
         }
@@ -528,7 +531,7 @@ void isr_usbctrl(void) {
  * @param buf the data that was sent
  * @param len the length that was sent
  */
-void ep0_in_handler(uint8_t *buf, uint16_t len) {
+void ep0_in_handler(uint8_t *buf, uint16_t len, uint8_t should_handle) {
     if (should_set_address) {
         // Set actual device address in hardware
         usb_hw->dev_addr_ctrl = dev_addr;
@@ -540,27 +543,166 @@ void ep0_in_handler(uint8_t *buf, uint16_t len) {
     }
 }
 
-void ep0_out_handler(uint8_t *buf, uint16_t len) {
+void ep0_out_handler(uint8_t *buf, uint16_t len, uint8_t should_handle) {
     ;
 }
 
-// Device specific functions
-void ep1_out_handler(uint8_t *buf, uint16_t len) {
-    printf("RX %d bytes from host\n", len);
-    // Send data back to host
-    struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP2_IN_ADDR);
-    usb_start_transfer(ep, buf, len);
+
+
+void prepare_data();
+#define DAT_SIZE 64
+static uint8_t tdat[DAT_SIZE];
+static uint32_t counter = 0;
+
+/**
+ * @brief setup test data
+ **/ 
+void prepare_data()
+{
+    uint32_t *tdat_int = (uint32_t *)tdat;
+    for (uint16_t i = 0; i < DAT_SIZE / 4; i++)
+    {
+        tdat_int[i] = counter;
+    }
+    counter++;
 }
 
-void ep2_in_handler(uint8_t *buf, uint16_t len) {
-    printf("Sent %d bytes to host\n", len);
-    // Get ready to rx again from host
-    usb_start_transfer(usb_get_endpoint_configuration(EP1_OUT_ADDR), NULL, 64);
+
+/**
+ * @brief Set up the endpoint control register for an endpoint (if applicable. Not valid for EP0).
+ *
+ * @param ep
+ * @param enable_double_buffer
+ */
+void usb_set_endpoint_double_buffering(const struct usb_endpoint_configuration *ep, uint8_t enable_double_buffer) {
+    printf("Updating endpoint 0x%x with buffer address 0x%p\n", ep->descriptor->bEndpointAddress, ep->data_buffer);
+    if(enable_double_buffer) {
+        *ep->endpoint_control |= EP_CTRL_DOUBLE_BUFFERED_BITS;
+    } else {
+        *ep->endpoint_control &= ~EP_CTRL_DOUBLE_BUFFERED_BITS;
+    }
+}
+
+/**
+ * @brief Execute a 16 bit write to buffer control register
+ *
+ * @param ep, the endpoint configuration.
+ * @param buf_num, the buffer number (0 or 1) for double buffered or only 0 for single buffered
+ * @param value
+ */
+void _hw_endpoint_buffer_control_update16(struct usb_endpoint_configuration *ep, uint8_t buf_num, uint16_t value)
+{
+    //reinterpret as 16 bit register
+    volatile uint16_t *hw_buf_ctrl_reg = (uint16_t *)ep->buffer_control;
+
+    if (buf_num)
+    {
+        //point to buffer1
+        hw_buf_ctrl_reg++;
+    }
+
+    if (value && value & USB_BUF_CTRL_AVAIL)
+    {
+        if (*hw_buf_ctrl_reg & USB_BUF_CTRL_AVAIL)
+        {
+            panic("buffer was already set as available\n");
+        }
+        *hw_buf_ctrl_reg = value & ~USB_BUF_CTRL_AVAIL;
+        //According to RP2040 datasheet: When cpu is faster than USB bus, wait some some, so that usb finsihed a cycle
+        // 12 cycle delay.. (should be good for 48*12Mhz = 576Mhz)
+        __asm volatile(
+            "b 1f\n"
+            "1: b 1f\n"
+            "1: b 1f\n"
+            "1: b 1f\n"
+            "1: b 1f\n"
+            "1: b 1f\n"
+            "1:\n"
+            :
+            :
+            : "memory");
+    }
+    *hw_buf_ctrl_reg = value;
+}
+
+/**
+ * @brief prepare a buffer control register(16 bit part) and copy data to USB buffer
+ **/
+static uint16_t prepare_ep_buffer(struct usb_endpoint_configuration *ep, uint8_t *buf, uint16_t buflen, uint8_t buf_id)
+{
+  //uint16_t const buflen = tu_min16(ep->remaining_len, ep->wMaxPacketSize);
+  //ep->remaining_len = (uint16_t)(ep->remaining_len - buflen);
+
+  assert(buflen <= 64);
+  uint16_t buf_ctrl = buflen | USB_BUF_CTRL_AVAIL;
+
+  if (ep_is_tx(ep))
+  {
+      // Need to copy the data from the user buffer to the usb memory
+      // add offset according to buf_id
+      memcpy((void *)ep->data_buffer + buf_id*64, (void *)buf, buflen);
+      // Mark as full
+      buf_ctrl |= USB_BUF_CTRL_FULL;
+  }
+
+  // PID
+  buf_ctrl |= ep->next_pid ? USB_BUF_CTRL_DATA1_PID : USB_BUF_CTRL_DATA0_PID;
+  ep->next_pid ^= 1u;
+
+  //upper half of the buffer control register is responsible for buffer 1
+  //if (buf_id) buf_ctrl = buf_ctrl << 16;
+
+  return buf_ctrl;
+}
+
+// Device specific functions
+void ep1_out_handler(uint8_t *buf, uint16_t len, uint8_t should_handle) {
+    // Send data back to host
+    memcpy((void *) tdat, (void *) buf, len);
+    //if(*(uint32_t*)tdat % 10000 == 0) {
+    //    printf("counter: %d\n", *(uint32_t*)tdat);
+    //}
+
+    struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP1_OUT_ADDR);
+    uint16_t buf_ctrl = prepare_ep_buffer(ep, tdat, 64, should_handle);
+    _hw_endpoint_buffer_control_update16(ep, should_handle, buf_ctrl);
+}
+
+struct usb_endpoint_configuration *ep2_in_config;
+void ep2_in_handler(uint8_t *buf, uint16_t len, uint8_t should_handle) {
+    if(!ep2_in_config) {
+        ep2_in_config = usb_get_endpoint_configuration(EP2_IN_ADDR);
+    }
+    prepare_data();
+    uint16_t buf_ctrl = prepare_ep_buffer(ep2_in_config, tdat, 64, should_handle);
+    _hw_endpoint_buffer_control_update16(ep2_in_config, should_handle, buf_ctrl);
+}
+
+void start_speedtest() {
+
+    struct usb_endpoint_configuration *ep = usb_get_endpoint_configuration(EP2_IN_ADDR);
+    struct usb_endpoint_configuration *ep_out = usb_get_endpoint_configuration(EP1_OUT_ADDR);
+
+    //prepare buffer 0
+    //USB_BUF_CTRL_SEL will set selected buffer to buffer 0
+    prepare_data();
+    uint16_t buf_ctrl = prepare_ep_buffer(ep, tdat, 64, 0) | USB_BUF_CTRL_SEL;
+    _hw_endpoint_buffer_control_update16(ep, 0, buf_ctrl);
+
+    //prepare buffer 1
+    prepare_data();
+    buf_ctrl |= prepare_ep_buffer(ep, tdat, 64, 1);
+    _hw_endpoint_buffer_control_update16(ep, 1, buf_ctrl);
+
+    buf_ctrl = prepare_ep_buffer(ep_out, tdat, 64, 0);
+    _hw_endpoint_buffer_control_update16(ep_out, 0, buf_ctrl);
+    buf_ctrl = prepare_ep_buffer(ep_out, tdat, 64, 1);
+    _hw_endpoint_buffer_control_update16(ep_out, 1, buf_ctrl);
 }
 
 int main(void) {
     stdio_init_all();
-    printf("USB Device Low-Level hardware example\n");
+    printf("USB Device Low-Level speedtest\n");
     usb_device_init();
 
     // Wait until configured
@@ -568,8 +710,13 @@ int main(void) {
         tight_loop_contents();
     }
 
+    usb_set_endpoint_double_buffering(usb_get_endpoint_configuration(EP2_IN_ADDR), true);
+        usb_set_endpoint_double_buffering(usb_get_endpoint_configuration(EP1_OUT_ADDR), true);
+
+    prepare_data();
+
     // Get ready to rx from host
-    usb_start_transfer(usb_get_endpoint_configuration(EP1_OUT_ADDR), NULL, 64);
+    start_speedtest();
 
     // Everything is interrupt driven so just loop here
     while (1) {
@@ -578,3 +725,5 @@ int main(void) {
 
     return 0;
 }
+
+

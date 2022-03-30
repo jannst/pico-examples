@@ -10,7 +10,9 @@
 #include "usb_common.h"
 
 // Struct in which we keep the endpoint configuration
-typedef void (*usb_ep_handler)(uint8_t *buf, uint16_t len);
+//JnnST start (add should_handle parameter for double buffered endpoints)
+typedef void (*usb_ep_handler)(uint8_t *buf, uint16_t len, uint8_t should_handle);
+//JannST end
 struct usb_endpoint_configuration {
     const struct usb_endpoint_descriptor *descriptor;
     usb_ep_handler handler;
@@ -70,7 +72,7 @@ static const struct usb_device_descriptor device_descriptor = {
         .bDeviceProtocol = 0,      // No protocol
         .bMaxPacketSize0 = 64,     // Max packet size for ep0
         .idVendor        = 0x0000, // Your vendor id
-        .idProduct       = 0x0001, // Your product ID
+        .idProduct       = 0x0002, // Your product ID
         .bcdDevice       = 0,      // No device revision number
         .iManufacturer   = 1,      // Manufacturer string index
         .iProduct        = 2,      // Product string index

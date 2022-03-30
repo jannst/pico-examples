@@ -1,6 +1,5 @@
 add_executable(dev_lowlevel_double_buffer
         dev_lowlevel.c
-        dev_lowlevel_speedtest.c
         )
 
 target_link_libraries(dev_lowlevel_double_buffer PRIVATE pico_stdlib hardware_resets hardware_irq)
